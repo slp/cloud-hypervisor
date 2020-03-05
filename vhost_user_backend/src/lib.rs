@@ -13,7 +13,7 @@ use std::io;
 use std::num::Wrapping;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::result;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use vhost_rs::vhost_user::message::{
     VhostUserConfigFlags, VhostUserMemoryRegion, VhostUserProtocolFeatures,
@@ -85,7 +85,19 @@ pub trait VhostUserBackend: Send + Sync + 'static {
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
+        async_sender: Option<mpsc::Sender<u16>>,
     ) -> result::Result<bool, io::Error>;
+
+    /// This function gets called by the vring completion workers when they
+    /// receive a message from the backend indicating that a request has been
+    /// processed.
+    fn handle_completion(
+        &mut self,
+        _head_index: u16,
+        _vring: Arc<RwLock<Vring>>,
+    ) -> result::Result<bool, io::Error> {
+        Ok(true)
+    }
 
     /// Get virtio device configuration.
     /// A default implementation is provided as we cannot expect all backends
@@ -131,9 +143,14 @@ impl<S: VhostUserBackend> VhostUserDaemon<S> {
     /// listening onto registered event. Those events can be vring events or
     /// custom events from the backend, but they get to be registered later
     /// during the sequence.
-    pub fn new(name: String, sock_path: String, backend: Arc<RwLock<S>>) -> Result<Self> {
+    pub fn new(
+        name: String,
+        sock_path: String,
+        backend: Arc<RwLock<S>>,
+        async_workers: bool,
+    ) -> Result<Self> {
         let handler = Arc::new(Mutex::new(
-            VhostUserHandler::new(backend).map_err(Error::NewVhostUserHandler)?,
+            VhostUserHandler::new(backend, async_workers).map_err(Error::NewVhostUserHandler)?,
         ));
 
         Ok(VhostUserDaemon {
@@ -286,6 +303,7 @@ type VringEpollHandlerResult<T> = std::result::Result<T, VringEpollHandlerError>
 struct VringEpollHandler<S: VhostUserBackend> {
     backend: Arc<RwLock<S>>,
     vrings: Vec<Arc<RwLock<Vring>>>,
+    completion_senders: Option<Vec<mpsc::Sender<u16>>>,
     exit_event_id: Option<u16>,
 }
 
@@ -313,10 +331,15 @@ impl<S: VhostUserBackend> VringEpollHandler<S> {
             }
         }
 
+        let completion_sender = match &self.completion_senders {
+            Some(senders) => Some(senders[device_event as usize].clone()),
+            None => None,
+        };
+
         self.backend
             .write()
             .unwrap()
-            .handle_event(device_event, evset, &self.vrings)
+            .handle_event(device_event, evset, &self.vrings, completion_sender)
             .map_err(VringEpollHandlerError::HandleEventBackendHandling)
     }
 }
@@ -423,6 +446,36 @@ impl VringWorker {
 }
 
 #[derive(Debug)]
+/// Errors related to completion worker.
+enum CompletionWorkerError {
+    /// Failed to handle the completion.
+    HandleCompletion(io::Error),
+}
+
+/// Result of completion worker operations.
+type CompletionWorkerResult<T> = std::result::Result<T, CompletionWorkerError>;
+
+pub struct CompletionWorker<S: VhostUserBackend> {
+    backend: Arc<RwLock<S>>,
+    vring: Arc<RwLock<Vring>>,
+    receiver: mpsc::Receiver<u16>,
+}
+
+impl<S: VhostUserBackend> CompletionWorker<S> {
+    fn run(&self) -> CompletionWorkerResult<()> {
+        while let Ok(index) = self.receiver.recv() {
+            self.backend
+                .write()
+                .unwrap()
+                .handle_completion(index, self.vring.clone())
+                .map_err(CompletionWorkerError::HandleCompletion)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 /// Errors related to vhost-user handler.
 pub enum VhostUserHandlerError {
     /// Failed to create epoll file descriptor.
@@ -470,7 +523,7 @@ struct VhostUserHandler<S: VhostUserBackend> {
 }
 
 impl<S: VhostUserBackend> VhostUserHandler<S> {
-    fn new(backend: Arc<RwLock<S>>) -> VhostUserHandlerResult<Self> {
+    fn new(backend: Arc<RwLock<S>>, completion_workers: bool) -> VhostUserHandlerResult<Self> {
         let num_queues = backend.read().unwrap().num_queues();
         let max_queue_size = backend.read().unwrap().max_queue_size();
 
@@ -501,9 +554,32 @@ impl<S: VhostUserBackend> VhostUserHandler<S> {
                 None
             };
 
+        let completion_senders = if completion_workers {
+            let mut senders = Vec::new();
+            for v in &vrings {
+                let (tx, rx) = mpsc::channel();
+                let completion_worker = CompletionWorker {
+                    backend: backend.clone(),
+                    vring: v.clone(),
+                    receiver: rx,
+                };
+
+                thread::Builder::new()
+                    .name("completion_worker".to_string())
+                    .spawn(move || completion_worker.run())
+                    .map_err(VhostUserHandlerError::SpawnVringWorker)?;
+
+                senders.push(tx);
+            }
+            Some(senders)
+        } else {
+            None
+        };
+
         let vring_handler = VringEpollHandler {
             backend: backend.clone(),
             vrings: vrings.clone(),
+            completion_senders,
             exit_event_id,
         };
 

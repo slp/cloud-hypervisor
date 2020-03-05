@@ -23,7 +23,7 @@ use std::io::{self};
 use std::net::Ipv4Addr;
 use std::os::unix::io::AsRawFd;
 use std::process;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::vec::Vec;
 use vhost_rs::vhost_user::message::*;
 use vhost_rs::vhost_user::Error as VhostUserError;
@@ -288,6 +288,7 @@ impl VhostUserBackend for VhostUserNetBackend {
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
+        _completion_sender: Option<mpsc::Sender<u16>>,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
@@ -443,6 +444,7 @@ pub fn start_net_backend(backend_command: &str) {
         "vhost-user-net-backend".to_string(),
         backend_config.sock.to_string(),
         net_backend.clone(),
+        false,
     )
     .unwrap();
 

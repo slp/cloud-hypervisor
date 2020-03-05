@@ -14,7 +14,7 @@ use epoll;
 use libc::EFD_NONBLOCK;
 use log::*;
 use std::num::Wrapping;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::{convert, error, fmt, io, process};
 
 use vhost_rs::vhost_user::message::*;
@@ -178,6 +178,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
+        _completion_sender: Option<mpsc::Sender<u16>>,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
@@ -268,6 +269,7 @@ fn main() {
         String::from("vhost-user-fs-backend"),
         sock,
         fs_backend.clone(),
+        false,
     )
     .unwrap();
 

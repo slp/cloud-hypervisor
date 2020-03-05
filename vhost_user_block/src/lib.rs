@@ -27,7 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process;
 use std::slice;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::Instant;
 use std::vec::Vec;
 use std::{convert, error, fmt, io};
@@ -262,6 +262,7 @@ impl VhostUserBackend for VhostUserBlkBackend {
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
+        _completion_sender: Option<mpsc::Sender<u16>>,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
@@ -422,6 +423,7 @@ pub fn start_block_backend(backend_command: &str) {
         name.to_string(),
         backend_config.sock.to_string(),
         blk_backend.clone(),
+        false,
     )
     .unwrap();
     debug!("blk_daemon is created!\n");
