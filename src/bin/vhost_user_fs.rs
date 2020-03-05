@@ -11,6 +11,7 @@ extern crate vm_virtio;
 
 use clap::{App, Arg};
 use epoll;
+use futures::executor::ThreadPool;
 use libc::EFD_NONBLOCK;
 use log::*;
 use std::num::Wrapping;
@@ -30,7 +31,8 @@ use virtio_bindings::bindings::virtio_net::*;
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
+use vm_virtio::queue::DescriptorChain;
 use vmm_sys_util::eventfd::EventFd;
 
 const QUEUE_SIZE: usize = 1024;
@@ -50,6 +52,8 @@ type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
 enum Error {
     /// Failed to create kill eventfd.
     CreateKillEventFd(io::Error),
+    /// Failed to create thread pool.
+    CreateThreadPool(io::Error),
     /// Failed to handle event other than input event.
     HandleEventNotEpollIn,
     /// Failed to handle unknown event.
@@ -62,8 +66,6 @@ enum Error {
     QueueReader(VufDescriptorError),
     /// Creating a queue writer failed.
     QueueWriter(VufDescriptorError),
-    /// Signaling queue failed.
-    SignalQueue(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -81,12 +83,13 @@ impl convert::From<Error> for io::Error {
 }
 
 struct VhostUserFsBackend<F: FileSystem + Send + Sync + 'static> {
-    mem: Option<GuestMemoryMmap>,
+    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     kill_evt: EventFd,
     server: Arc<Server<F>>,
     // handle request from slave to master
     vu_req: Option<SlaveFsCacheReq>,
     event_idx: bool,
+    pool: ThreadPool,
 }
 
 impl<F: FileSystem + Send + Sync + 'static> Clone for VhostUserFsBackend<F> {
@@ -97,6 +100,7 @@ impl<F: FileSystem + Send + Sync + 'static> Clone for VhostUserFsBackend<F> {
             server: self.server.clone(),
             vu_req: self.vu_req.clone(),
             event_idx: self.event_idx,
+            pool: self.pool.clone(),
         }
     }
 }
@@ -109,35 +113,54 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
             server: Arc::new(Server::new(fs)),
             vu_req: None,
             event_idx: false,
+            pool: ThreadPool::new().map_err(Error::CreateThreadPool)?,
         })
     }
 
-    fn process_queue(&mut self, vring: &mut Vring) -> Result<bool> {
+    fn process_queue(
+        &mut self,
+        vring: &mut Vring,
+        async_sender: Option<mpsc::Sender<u16>>,
+    ) -> Result<bool> {
         let mut used_any = false;
-        let mem = self.mem.as_ref().ok_or(Error::NoMemoryConfigured)?;
+        let (atomic_mem, mem) = match &self.mem {
+            Some(m) => (m, m.memory()),
+            None => return Err(Error::NoMemoryConfigured),
+        };
 
         while let Some(avail_desc) = vring.mut_queue().iter(&mem).next() {
-            let head_index = avail_desc.index;
-            let reader = Reader::new(mem, avail_desc.clone()).map_err(Error::QueueReader)?;
-            let writer = Writer::new(mem, avail_desc.clone()).map_err(Error::QueueWriter)?;
+            let desc_head = avail_desc.get_head();
+            let scoped_mem = atomic_mem.clone();
+            let server = self.server.clone();
+            let mut vu_req = self.vu_req.clone();
+            let sender = match &async_sender {
+                Some(s) => Some(s.clone()),
+                None => None,
+            };
 
-            self.server
-                .handle_message(reader, writer, self.vu_req.as_mut())
-                .map_err(Error::ProcessQueue)?;
-            if self.event_idx {
-                if let Some(used_idx) = vring.mut_queue().add_used(mem, head_index, 0) {
-                    let used_event = vring.mut_queue().get_used_event(mem);
-                    if vring.needs_notification(Wrapping(used_idx), used_event) {
-                        vring.signal_used_queue().map_err(Error::SignalQueue)?;
-                    }
-                    used_any = true;
+            self.pool.spawn_ok(async move {
+                let mem = scoped_mem.memory();
+                let desc = DescriptorChain::new_from_head(&mem, desc_head).unwrap();
+                let head_index = desc.index;
+
+                let reader = Reader::new(&mem, desc.clone())
+                    .map_err(Error::QueueReader)
+                    .unwrap();
+                let writer = Writer::new(&mem, desc.clone())
+                    .map_err(Error::QueueWriter)
+                    .unwrap();
+
+                server
+                    .handle_message(reader, writer, vu_req.as_mut())
+                    .map_err(Error::ProcessQueue)
+                    .unwrap();
+
+                if let Some(sender) = sender {
+                    sender.send(head_index).unwrap();
                 }
-            } else {
-                vring.mut_queue().add_used(mem, head_index, 0);
-                vring.signal_used_queue().map_err(Error::SignalQueue)?;
-                used_any = true;
-            }
-            vring.signal_used_queue().map_err(Error::SignalQueue)?;
+            });
+
+            used_any = true;
         }
 
         Ok(used_any)
@@ -169,7 +192,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
     }
 
     fn update_memory(&mut self, mem: GuestMemoryMmap) -> VhostUserBackendResult<()> {
-        self.mem = Some(mem);
+        self.mem = Some(GuestMemoryAtomic::new(mem));
         Ok(())
     }
 
@@ -178,11 +201,16 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
-        _completion_sender: Option<mpsc::Sender<u16>>,
+        completion_sender: Option<mpsc::Sender<u16>>,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
+
+        let mem = match &self.mem {
+            Some(m) => m.memory(),
+            None => return Err(Error::NoMemoryConfigured.into()),
+        };
 
         let mut vring = match device_event {
             HIPRIO_QUEUE_EVENT => {
@@ -202,16 +230,41 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
             // calling process_queue() until it stops finding new
             // requests on the queue.
             loop {
-                vring
-                    .mut_queue()
-                    .update_avail_event(self.mem.as_ref().ok_or(Error::NoMemoryConfigured)?);
-                if !self.process_queue(&mut vring)? {
+                vring.mut_queue().update_avail_event(&mem);
+                if !self.process_queue(&mut vring, completion_sender.clone())? {
                     break;
                 }
             }
         } else {
             // Without EVENT_IDX, a single call is enough.
-            self.process_queue(&mut vring)?;
+            self.process_queue(&mut vring, completion_sender)?;
+        }
+
+        Ok(false)
+    }
+
+    fn handle_completion(
+        &mut self,
+        head_index: u16,
+        vring: Arc<RwLock<Vring>>,
+    ) -> VhostUserBackendResult<bool> {
+        let mem = match &self.mem {
+            Some(m) => m.memory(),
+            None => return Err(Error::NoMemoryConfigured.into()),
+        };
+
+        let mut vring = vring.write().unwrap();
+
+        if self.event_idx {
+            if let Some(used_idx) = vring.mut_queue().add_used(&mem, head_index, 0) {
+                let used_event = vring.mut_queue().get_used_event(&mem);
+                if vring.needs_notification(Wrapping(used_idx), used_event) {
+                    vring.signal_used_queue()?;
+                }
+            }
+        } else {
+            vring.mut_queue().add_used(&mem, head_index, 0);
+            vring.signal_used_queue()?;
         }
 
         Ok(false)
@@ -269,7 +322,7 @@ fn main() {
         String::from("vhost-user-fs-backend"),
         sock,
         fs_backend.clone(),
-        false,
+        true,
     )
     .unwrap();
 
