@@ -257,8 +257,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
 
         if self.event_idx {
             if let Some(used_idx) = vring.mut_queue().add_used(&mem, head_index, 0) {
-                let used_event = vring.mut_queue().get_used_event(&mem);
-                if vring.needs_notification(Wrapping(used_idx), used_event) {
+                if vring.needs_notification(&mem, Wrapping(used_idx)) {
                     vring.signal_used_queue()?;
                 }
             }
